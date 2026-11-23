@@ -1,193 +1,306 @@
 import tkinter as tk
+from collections import Counter
+from sys import platform
 from tkinter import messagebox, ttk
 
 import database
 
 
+SECTIONS = {
+    'main': 'Контакты',
+    'fam': 'Фамилии',
+    'name': 'Имена',
+    'otc': 'Отчества',
+    'street': 'Улицы',
+}
+
+CONTACT_FIELDS = {
+    'fam': 'Фамилия',
+    'name': 'Имя',
+    'otc': 'Отчество',
+    'street': 'Улица',
+    'bldn': 'Дом',
+    'bldn_k': 'Корпус',
+    'appr': 'Квартира',
+    'telef': 'Телефон',
+}
+
+
+def set_dark_title(root):
+    if platform != 'win32':
+        return
+
+    from ctypes import byref, c_int, sizeof, windll
+    from ctypes.wintypes import HWND, UINT
+
+    get_ancestor = windll.user32.GetAncestor
+    get_ancestor.argtypes = (HWND, UINT)
+    get_ancestor.restype = HWND
+    window = HWND(get_ancestor(root.winfo_id(), 2))
+
+    # параметры windows для тёмного заголовка, чёрного фона и светлого текста
+    for attribute, value in ((20, 1), (35, 0x000000), (36, 0xf2f3f4)):
+        setting = c_int(value)
+        windll.dwmapi.DwmSetWindowAttribute(window, attribute, byref(setting), sizeof(setting))
+
+
 class DatabaseClient:
     def __init__(self, root):
-        root.title('Клиент PostgreSQL')
-        root.geometry('1050x700')
+        root.title('Телефонный справочник')
+        root.geometry('1180x700')
+        root.minsize(960, 540)
+        root.configure(background='#292b2e')
+        root.after_idle(set_dark_title, root)
         self.connection = None
-        self.editors = {}
+        self.table = 'main'
+        self.fields = {}
+        self.options = {}
+        self.rows = {}
 
-        connection_frame = ttk.LabelFrame(root, text='Подключение')
-        connection_frame.pack(fill='x', padx=10, pady=8)
-        self.connection_fields = {}
-        for index, (name, default) in enumerate((
-            ('Хост', 'localhost'), ('Порт', '5432'), ('База данных', ''),
-            ('Пользователь', ''), ('Пароль', ''),
+        style = ttk.Style(root)
+        style.theme_use('clam')
+        style.configure('.', background='#292b2e', foreground='#f2f3f4',
+                        fieldbackground='#202225', bordercolor='#4b4e52',
+                        lightcolor='#4b4e52', darkcolor='#4b4e52', font=('Segoe UI', 10))
+        style.configure('TEntry', padding=5, insertcolor='#f2f3f4')
+        style.configure('TCombobox', padding=5, arrowcolor='#f2f3f4', insertcolor='#f2f3f4')
+        style.map('TCombobox', fieldbackground=[('readonly', '#202225')],
+                  foreground=[('readonly', '#f2f3f4')], selectbackground=[('readonly', '#202225')],
+                  selectforeground=[('readonly', '#f2f3f4')])
+        style.configure('TButton', padding=(8, 6), background='#43464a')
+        style.map('TButton', background=[('pressed', '#555a60'), ('active', '#50555a')])
+        style.configure('Search.TButton', background='#406080')
+        style.map('Search.TButton', background=[('pressed', '#3a5671'), ('active', '#4e7399')])
+        style.configure('Treeview', background='#202225', fieldbackground='#202225', rowheight=31)
+        style.configure('Treeview.Heading', background='#34373a', padding=7)
+        style.map('Treeview', background=[('selected', '#40586e')], foreground=[('selected', '#ffffff')])
+        root.option_add('*TCombobox*Listbox.background', '#202225')
+        root.option_add('*TCombobox*Listbox.foreground', '#f2f3f4')
+
+        section_bar = ttk.Frame(root)
+        section_bar.pack(fill='x', padx=16, pady=(10, 4))
+        ttk.Label(section_bar, text='Раздел').pack(side='left', padx=(0, 8))
+        self.section = ttk.Combobox(section_bar, values=tuple(SECTIONS.values()), state='readonly', width=14)
+        self.section.current(0)
+        self.section.pack(side='left')
+        self.section.bind('<<ComboboxSelected>>', self.change_section)
+
+        ttk.Separator(root).pack(fill='x', padx=16, pady=10)
+        self.form = ttk.Frame(root)
+        self.form.pack(fill='x', padx=16)
+
+        actions = ttk.Frame(root)
+        actions.pack(fill='x', padx=16, pady=12)
+        for column, (label, command) in enumerate((
+            ('Поиск', self.search), ('Добавить', lambda: self.save()),
+            ('Изменить', self.edit), ('Удалить', self.delete),
+            ('Очистить', self.clear),
         )):
-            ttk.Label(connection_frame, text=name).grid(row=0, column=index * 2, padx=4, pady=6)
-            field = ttk.Entry(connection_frame, width=16, show='*' if name == 'Пароль' else '')
-            field.insert(0, default)
-            field.grid(row=0, column=index * 2 + 1, padx=4, pady=6)
-            self.connection_fields[name] = field
-        ttk.Button(connection_frame, text='Подключиться', command=self.connect_db).grid(
-            row=0, column=10, padx=6)
+            button_style = 'Search.TButton' if column == 0 else 'TButton'
+            ttk.Button(actions, text=label, command=command, style=button_style).grid(
+                row=0, column=column, sticky='ew', padx=(0 if column == 0 else 8, 0))
+            actions.columnconfigure(column, weight=1, uniform='actions')
 
-        toolbar = ttk.Frame(root)
-        toolbar.pack(fill='x', padx=10, pady=4)
-        ttk.Label(toolbar, text='Таблица:').pack(side='left', padx=(0, 5))
-        self.table_box = ttk.Combobox(toolbar, values=tuple(database.TABLE_IDS), state='readonly', width=14)
-        self.table_box.current(0)
-        self.table_box.pack(side='left', padx=4)
-        self.table_box.bind('<<ComboboxSelected>>', self.change_table)
-        for title, command in (
-            ('Обновить', self.load_table), ('Добавить', self.add_row),
-            ('Сохранить', self.save_row), ('Удалить', self.delete_row),
-        ):
-            ttk.Button(toolbar, text=title, command=command).pack(side='left', padx=4)
-
-        search_bar = ttk.Frame(root)
-        search_bar.pack(fill='x', padx=10, pady=4)
-        ttk.Label(search_bar, text='Искать по полю:').pack(side='left')
-        self.search_column = ttk.Combobox(search_bar, state='readonly', width=14)
-        self.search_column.pack(side='left', padx=4)
-        self.search_entry = ttk.Entry(search_bar, width=28)
-        self.search_entry.pack(side='left', padx=4)
-        self.search_entry.bind('<Return>', self.load_table)
-        ttk.Button(search_bar, text='Найти', command=self.load_table).pack(side='left', padx=4)
-        ttk.Button(search_bar, text='Сбросить поиск', command=self.reset_search).pack(side='left', padx=4)
-
-        table_frame = ttk.Frame(root)
-        table_frame.pack(fill='both', expand=True, padx=10, pady=6)
-        self.grid = ttk.Treeview(table_frame, show='headings', selectmode='browse')
-        vertical_scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.grid.yview)
-        horizontal_scroll = ttk.Scrollbar(table_frame, orient='horizontal', command=self.grid.xview)
-        self.grid.configure(yscrollcommand=vertical_scroll.set, xscrollcommand=horizontal_scroll.set)
-        self.grid.grid(row=0, column=0, sticky='nsew')
-        vertical_scroll.grid(row=0, column=1, sticky='ns')
-        horizontal_scroll.grid(row=1, column=0, sticky='ew')
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
+        self.grid = ttk.Treeview(root, show='headings', selectmode='browse')
+        self.grid.pack(fill='both', expand=True, padx=16)
         self.grid.bind('<<TreeviewSelect>>', self.select_row)
 
-        self.form = ttk.LabelFrame(root, text='Поля записи')
-        self.form.pack(fill='x', padx=10, pady=6)
-        self.status = tk.StringVar(value='Укажите параметры подключения')
-        ttk.Label(root, textvariable=self.status, anchor='w').pack(fill='x', padx=10, pady=(0, 8))
+        self.status = tk.StringVar(value='Подключение к PostgreSQL…')
+        ttk.Label(root, textvariable=self.status).pack(fill='x', padx=16, pady=7)
+        self.open_section('main')
+        root.after_idle(self.connect_db)
 
     def connect_db(self):
         try:
-            values = {name: field.get().strip() for name, field in self.connection_fields.items()}
-            connection = database.connect(
-                host=values['Хост'], port=values['Порт'], dbname=values['База данных'],
-                user=values['Пользователь'], password=self.connection_fields['Пароль'].get(),
-            )
-            if self.connection:
-                self.connection.close()
-            self.connection = connection
-            self.change_table()
+            self.connection = database.connect_db()
         except Exception as error:
+            self.status.set('Нет подключения к PostgreSQL')
+            messagebox.showerror('Подключение', str(error))
+            return
+        self.open_section(self.table)
+
+    def change_section(self, _event):
+        self.open_section(tuple(SECTIONS)[self.section.current()])
+
+    def open_section(self, table):
+        self.table = table
+        self.section.set(SECTIONS[table])
+        for widget in self.form.winfo_children():
+            widget.destroy()
+        self.fields = {}
+        self.options = {}
+        fields = CONTACT_FIELDS if table == 'main' else {
+            database.LOOKUP_COLUMNS[table]: CONTACT_FIELDS[table],
+        }
+        columns = ('id', *fields)
+        self.grid['columns'] = columns
+        self.grid.heading('id', text='Код')
+        self.grid.column('id', width=60, minwidth=55, stretch=False, anchor='center')
+        for column, label in fields.items():
+            self.grid.heading(column, text=label)
+            width = 75 if column in ('bldn', 'bldn_k', 'appr') else 125
+            self.grid.column(column, width=width, minwidth=65)
+
+        try:
+            for index, (column, label) in enumerate(fields.items()):
+                row, position = divmod(index, 7)
+                if row == 0:
+                    self.form.columnconfigure(position, weight=2 if position < 4 else 1)
+                box = ttk.Frame(self.form)
+                box.grid(row=row, column=position, padx=(0, 8), pady=(0, 8), sticky='ew')
+                ttk.Label(box, text=label).pack(anchor='w', pady=(0, 4))
+                if column in database.LOOKUP_COLUMNS:
+                    field = ttk.Combobox(box, width=12,
+                                         postcommand=lambda name=column: self.refresh_options(name))
+                    ttk.Button(box, text='…', width=2, command=lambda name=column: self.open_section(name)).pack(
+                        side='right', padx=(4, 0))
+                else:
+                    field = ttk.Entry(box, width=10 if table == 'main' else 24)
+                field.pack(fill='x')
+                self.fields[column] = field
+                if column in database.LOOKUP_COLUMNS:
+                    self.refresh_options(column)
+        except Exception as error:
+            self.grid.delete(*self.grid.get_children())
+            self.rows = {}
+            self.fields = {}
+            self.status.set('Не удалось загрузить справочники')
             messagebox.showerror('Ошибка', str(error))
+            return
 
-    def change_table(self, _event=None):
-        self.search_column.set('')
-        self.reset_search()
-
-    def reset_search(self):
-        self.search_entry.delete(0, 'end')
         self.load_table()
 
-    def load_table(self, _event=None):
+    def refresh_options(self, column):
+        field = self.fields[column]
+        text = field.get()
+        index = field.current()
+        selected = self.options[column][index][0] if index >= 0 else None
+        try:
+            rows = database.load_options(self.connection, column) if self.connection else []
+        except Exception as error:
+            messagebox.showerror('Справочник', str(error))
+            rows = self.options.get(column, [])[1:]
+
+        names = Counter(value for _, value in rows)
+        labels = ['']
+        for key, value in rows:
+            if not value:
+                value = f'Код {key}'
+            elif names[value] > 1:
+                value = f'{value} ({key})'
+            labels.append(value)
+
+        self.options[column] = [(None, None)] + rows
+        field['values'] = labels
+        ids = [key for key, _ in self.options[column]]
+        if selected is not None and selected in ids:
+            field.current(ids.index(selected))
+        else:
+            field.set(text)
+
+    def form_values(self):
+        values = {}
+        for column, field in self.fields.items():
+            value = field.get().strip() or None
+            if column in self.options:
+                index = field.current()
+                if index >= 0:
+                    value = self.options[column][index][0]
+            values[column] = value
+        return values
+
+    def load_table(self, filters=None):
+        self.grid.delete(*self.grid.get_children())
+        self.rows = {}
         if not self.connection:
             return
-        table = self.table_box.get()
-        search_column = self.search_column.get()
-        term = self.search_entry.get().strip()
-        self.grid.delete(*self.grid.get_children())
-        self.clear_form()
         try:
-            columns, rows = database.load_rows(self.connection, table, search_column, term)
+            rows = database.load_rows(self.connection, self.table, filters or {})
         except Exception as error:
-            self.grid['columns'] = ()
-            self.search_column['values'] = ()
-            self.search_column.set('')
-            self.status.set(f'Не удалось загрузить таблицу {table}')
+            self.status.set('Не удалось загрузить записи')
             messagebox.showerror('Ошибка', str(error))
             return
 
-        self.search_column['values'] = columns
-        if not search_column:
-            self.search_column.current(0)
-        self.grid['columns'] = columns
-        for column in columns:
-            self.grid.heading(column, text=column)
-            self.grid.column(column, width=130, minwidth=70)
         for row in rows:
-            self.grid.insert('', 'end', values=tuple('' if value is None else value for value in row))
-        action = 'найдено строк' if term and search_column else 'загружено строк'
-        self.status.set(f'{table}: {action} — {len(rows)} (максимум 1000)')
+            key = str(row[0])
+            self.rows[key] = row
+            shown = row[:9] if self.table == 'main' else row
+            self.grid.insert('', 'end', iid=key, values=['' if value is None else value for value in shown])
+        self.status.set(f'Строк в таблице: {len(rows)} (до 1000)')
 
-    def clear_form(self):
-        for child in self.form.winfo_children():
-            child.destroy()
-        self.editors = {}
-
-    def select_row(self, _event=None):
-        selected = self.grid.selection()
-        if selected:
-            self.show_form(self.grid.set(selected[0]))
-
-    def show_form(self, values=None):
-        self.clear_form()
-        primary_key = database.TABLE_IDS[self.table_box.get()]
-        columns = self.grid['columns']
-        if values is None:
-            columns = [column for column in columns if column != primary_key]
-        for index, column in enumerate(columns):
-            ttk.Label(self.form, text=column).grid(row=index // 4 * 2, column=index % 4, sticky='w', padx=6, pady=(5, 0))
-            field = ttk.Entry(self.form, width=24)
-            if values is not None:
-                field.insert(0, values[column])
-            if column == primary_key:
-                field.configure(state='readonly')
-            field.grid(row=index // 4 * 2 + 1, column=index % 4, sticky='ew', padx=6, pady=(0, 5))
-            self.editors[column] = field
-
-    def add_row(self):
-        if not self.grid['columns']:
-            return
-        self.grid.selection_remove(self.grid.selection())
-        self.show_form()
-        self.status.set('Заполните поля новой записи и нажмите «Сохранить»')
-
-    def save_row(self):
-        if not self.editors:
-            messagebox.showwarning('Нет записи', 'Выберите запись или нажмите «Добавить»')
-            return
-        table = self.table_box.get()
-        primary_key = database.TABLE_IDS[table]
-        values = {}
-        for column, field in self.editors.items():
-            if column != primary_key:
-                values[column] = field.get().strip() or None
-        try:
-            if primary_key in self.editors:
-                key = self.editors[primary_key].get()
-                database.update_row(self.connection, table, values, key)
-            else:
-                database.insert_row(self.connection, table, values)
-            self.load_table()
-        except Exception as error:
-            messagebox.showerror('Ошибка', str(error))
-
-    def delete_row(self):
+    def select_row(self, _event):
         selected = self.grid.selection()
         if not selected:
-            messagebox.showwarning('Нет записи', 'Сначала выберите запись в таблице')
             return
-        table = self.table_box.get()
-        primary_key = database.TABLE_IDS[table]
-        key = self.grid.set(selected[0], primary_key)
-        if not messagebox.askyesno('Удалить запись', f'Удалить запись {primary_key}={key}?'):
+        row = self.rows[selected[0]]
+        if self.table == 'main':
+            # последние четыре значения — id для выпадающих списков
+            values = row[9:] + row[5:9]
+        else:
+            values = row[1:]
+        for (column, field), value in zip(self.fields.items(), values):
+            if column in self.options:
+                ids = [key for key, _ in self.options[column]]
+                if value not in ids:
+                    self.refresh_options(column)
+                    ids = [key for key, _ in self.options[column]]
+                field.current(ids.index(value) if value in ids else 0)
+            else:
+                field.delete(0, 'end')
+                if value is not None:
+                    field.insert(0, str(value))
+
+    def search(self):
+        if self.fields:
+            self.load_table(self.form_values())
+
+    def clear(self):
+        self.grid.selection_remove(self.grid.selection())
+        for column, field in self.fields.items():
+            if column in self.options:
+                field.current(0)
+            else:
+                field.delete(0, 'end')
+        self.load_table()
+
+    def edit(self):
+        selected = self.grid.selection()
+        if not selected:
+            messagebox.showwarning('Изменение', 'Выберите запись в таблице')
+            return
+        self.save(selected[0])
+
+    def save(self, key=None):
+        if not self.connection or not self.fields:
+            return
+        values = self.form_values()
+        if all(value is None for value in values.values()):
+            messagebox.showwarning('Поля записи', 'Заполните хотя бы одно поле')
             return
         try:
-            database.delete_row(self.connection, table, key)
-            self.load_table()
+            if key is None:
+                database.insert_row(self.connection, self.table, values)
+            else:
+                database.update_row(self.connection, self.table, values, key)
         except Exception as error:
             messagebox.showerror('Ошибка', str(error))
+            return
+        self.clear()
+
+    def delete(self):
+        selected = self.grid.selection()
+        if not selected:
+            messagebox.showwarning('Удаление', 'Выберите запись в таблице')
+            return
+        key = selected[0]
+        if not messagebox.askyesno('Удаление', f'Удалить запись с кодом {key}?'):
+            return
+        try:
+            database.delete_row(self.connection, self.table, key)
+        except Exception as error:
+            messagebox.showerror('Ошибка', str(error))
+            return
+        self.clear()
 
 
 if __name__ == '__main__':
